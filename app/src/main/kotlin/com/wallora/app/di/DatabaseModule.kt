@@ -1,39 +1,39 @@
-package com.wallora.app.di
+package com.wallora.app.data.local
 
-import android.content.Context
-import androidx.room.Room
-import com.wallora.app.data.local.WalloraDatabase
+import androidx.room.Database
+import androidx.room.RoomDatabase
+import com.wallora.app.data.local.dao.CollectionDao
 import com.wallora.app.data.local.dao.FavoriteDao
 import com.wallora.app.data.local.dao.HistoryDao
+import com.wallora.app.data.local.dao.PlaylistDao
 import com.wallora.app.data.local.dao.RecentSearchDao
 import com.wallora.app.data.local.dao.WallpaperDao
-import dagger.Module
-import dagger.Provides
-import dagger.hilt.InstallIn
-import dagger.hilt.android.qualifiers.ApplicationContext
-import dagger.hilt.components.SingletonComponent
-import javax.inject.Singleton
+import com.wallora.app.data.local.entity.CollectionEntity
+import com.wallora.app.data.local.entity.CollectionItemEntity
+import com.wallora.app.data.local.entity.FavoriteEntity
+import com.wallora.app.data.local.entity.HistoryEntity
+import com.wallora.app.data.local.entity.PlaylistEntity
+import com.wallora.app.data.local.entity.RecentSearchEntity
+import com.wallora.app.data.local.entity.WallpaperEntity
 
-@Module
-@InstallIn(SingletonComponent::class)
-object DatabaseModule {
-
-    @Singleton
-    @Provides
-    fun provideDatabase(@ApplicationContext context: Context): WalloraDatabase =
-        Room.databaseBuilder(context, WalloraDatabase::class.java, "wallora.db")
-            .fallbackToDestructiveMigration()
-            .build()
-
-    @Provides
-    fun provideWallpaperDao(db: WalloraDatabase): WallpaperDao = db.wallpaperDao()
-
-    @Provides
-    fun provideFavoriteDao(db: WalloraDatabase): FavoriteDao = db.favoriteDao()
-
-    @Provides
-    fun provideHistoryDao(db: WalloraDatabase): HistoryDao = db.historyDao()
-
-    @Provides
-    fun provideRecentSearchDao(db: WalloraDatabase): RecentSearchDao = db.recentSearchDao()
+@Database(
+    entities = [
+        WallpaperEntity::class,
+        FavoriteEntity::class,
+        HistoryEntity::class,
+        RecentSearchEntity::class,
+        CollectionEntity::class,
+        CollectionItemEntity::class,
+        PlaylistEntity::class,
+    ],
+    version = 2,
+    exportSchema = true,
+)
+abstract class WalloraDatabase : RoomDatabase() {
+    abstract fun wallpaperDao(): WallpaperDao
+    abstract fun favoriteDao(): FavoriteDao
+    abstract fun historyDao(): HistoryDao
+    abstract fun recentSearchDao(): RecentSearchDao
+    abstract fun collectionDao(): CollectionDao
+    abstract fun playlistDao(): PlaylistDao
 }
