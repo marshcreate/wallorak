@@ -3,31 +3,16 @@ package com.wallora.app.data.paging
 import com.wallora.app.domain.model.Wallpaper
 import kotlin.math.abs
 
-/**
- * Reorders a page of wallpapers so that visually and topically similar images are not placed
- * next to each other in the grid.
- *
- * Why: the multi-source feed otherwise clusters same-source / same-category items together, and
- * many photography sources skew toward muted, similar-looking shots. Spreading out by dominant
- * colour ([Wallpaper.colorHint]), category and source makes adjacent tiles tell "different
- * stories" — the effect the user asked for (a red hero next to a black one next to a blue one).
- *
- * Pure Kotlin (no `android.graphics`) so it unit-tests without Robolectric. Deterministic for a
- * given input (stable index tie-break) so Paging stays stable across recompositions.
- */
+/** Reorders a page so visually and topically similar wallpapers are not adjacent. */
 object FeedDiversifier {
-
-    /** How many recently-placed items a candidate is compared against. Approximates 2–3 columns. */
     const val DEFAULT_WINDOW = 3
 
     private const val CATEGORY_PENALTY = 1.0f
     private const val SOURCE_PENALTY = 0.35f
     private const val HUE_WEIGHT = 1.0f
+    private const val MAX_SIMILARITY = CATEGORY_PENALTY + SOURCE_PENALTY + HUE_WEIGHT
 
-    /**
-     * Convert an (A)RGB int to HSV. Returns `[hue 0..360, saturation 0..1, value 0..1]`.
-     * Alpha is ignored.
-     */
+    /** Convert an (A)RGB int to HSV: hue 0..360, saturation 0..1, value 0..1. */
     fun argbToHsv(argb: Int): FloatArray {
         val r = ((argb shr 16) and 0xFF) / 255f
         val g = ((argb shr 8) and 0xFF) / 255f
@@ -46,83 +31,86 @@ object FeedDiversifier {
         return floatArrayOf(h, s, max)
     }
 
-    /** Shortest distance between two hues on the colour wheel, in degrees (0..180). */
     fun hueDistance(a: Float, b: Float): Float {
         val d = abs(a - b) % 360f
         return if (d > 180f) 360f - d else d
     }
 
-    /** Saturation × value — higher means a punchier, more colourful image. */
-    private fun colorfulness(w: Wallpaper): Float {
-        val c = w.colorHint ?: return 0f
-        val hsv = argbToHsv(c)
-        return hsv[1] * hsv[2]
+    private data class VisualInfo(val hue: Float?, val colorfulness: Float)
+
+    private fun visualInfo(wallpaper: Wallpaper): VisualInfo {
+        val color = wallpaper.colorHint ?: return VisualInfo(null, 0f)
+        val hsv = argbToHsv(color)
+        return VisualInfo(hsv[0], hsv[1] * hsv[2])
     }
 
-    /** How similar two wallpapers look/read. Higher = more similar = worse to place adjacently. */
-    private fun similarity(a: Wallpaper, b: Wallpaper): Float {
-        var s = 0f
-        if (a.category != null && a.category == b.category) s += CATEGORY_PENALTY
-        if (a.sourceId == b.sourceId) s += SOURCE_PENALTY
-        val ca = a.colorHint
-        val cb = b.colorHint
-        if (ca != null && cb != null) {
-            val ha = argbToHsv(ca)[0]
-            val hb = argbToHsv(cb)[0]
-            s += HUE_WEIGHT * (1f - hueDistance(ha, hb) / 180f)
+    private fun similarity(a: Wallpaper, b: Wallpaper, aHue: Float?, bHue: Float?): Float {
+        var score = 0f
+        if (a.category != null && a.category == b.category) score += CATEGORY_PENALTY
+        if (a.sourceId == b.sourceId) score += SOURCE_PENALTY
+        if (aHue != null && bHue != null) {
+            score += HUE_WEIGHT * (1f - hueDistance(aHue, bHue) / 180f)
         }
-        return s
+        return score
     }
 
-    /** Worst (max) similarity of [candidate] against the recent window. */
-    private fun badness(candidate: Wallpaper, window: List<Wallpaper>): Float {
+    /** Returns the maximum similarity against the recent window, stopping at the maximum score. */
+    private fun badness(
+        candidate: Wallpaper,
+        candidateHue: Float?,
+        window: ArrayDeque<Wallpaper>,
+        hueCache: Map<Wallpaper, Float?>,
+    ): Float {
         var worst = 0f
-        for (w in window) {
-            val s = similarity(candidate, w)
-            if (s > worst) worst = s
+        for (placed in window) {
+            worst = maxOf(worst, similarity(candidate, placed, candidateHue, hueCache[placed]))
+            if (worst >= MAX_SIMILARITY) return worst
         }
         return worst
     }
 
     /**
-     * Greedily reorder [items]: at each step pick the remaining item least similar to the last
-     * [windowK] placed. Tie-break by higher [colorfulness], then by original index (stable →
-     * deterministic). [tail] carries the last items emitted on the previous page so the first
-     * item of this page differs from the end of the last. Size is preserved — nothing is dropped.
+     * Greedily chooses the least similar remaining item. The algorithm remains O(n²), but hue and
+     * colorfulness are computed once per item instead of once per candidate/window comparison.
      */
     fun diverse(
         items: List<Wallpaper>,
         windowK: Int = DEFAULT_WINDOW,
         tail: List<Wallpaper> = emptyList(),
     ): List<Wallpaper> {
-        if (items.size <= 1) return items
+        if (items.size <= 1 || windowK <= 0) return items
+
+        val info = items.associateWith(::visualInfo)
         val remaining = ArrayList(items)
         val result = ArrayList<Wallpaper>(items.size)
         val window = ArrayDeque<Wallpaper>()
-        tail.takeLast(windowK).forEach { window.addLast(it) }
+        tail.takeLast(windowK).forEach(window::addLast)
+
+        // Tail items are not necessarily in items, so compute their hue once as well.
+        val hueCache = HashMap<Wallpaper, Float?>(items.size + tail.size)
+        info.forEach { (wallpaper, visual) -> hueCache[wallpaper] = visual.hue }
+        tail.forEach { wallpaper -> hueCache.putIfAbsent(wallpaper, visualInfo(wallpaper).hue) }
 
         while (remaining.isNotEmpty()) {
-            var bestIdx = 0
+            var bestIndex = 0
             var bestBadness = Float.MAX_VALUE
-            var bestColor = -1f
-            for (i in remaining.indices) {
-                val cand = remaining[i]
-                val bad = badness(cand, window)
-                if (bad < bestBadness) {
-                    bestIdx = i
-                    bestBadness = bad
-                    bestColor = colorfulness(cand)
-                } else if (bad == bestBadness) {
-                    val col = colorfulness(cand)
-                    if (col > bestColor) {
-                        bestIdx = i
-                        bestColor = col
-                    }
-                    // equal badness AND colour → keep the earlier index (deterministic)
+            var bestColorfulness = -1f
+
+            for (index in remaining.indices) {
+                val candidate = remaining[index]
+                val candidateInfo = info.getValue(candidate)
+                val candidateBadness = badness(candidate, candidateInfo.hue, window, hueCache)
+                if (candidateBadness < bestBadness ||
+                    (candidateBadness == bestBadness && candidateInfo.colorfulness > bestColorfulness)
+                ) {
+                    bestIndex = index
+                    bestBadness = candidateBadness
+                    bestColorfulness = candidateInfo.colorfulness
                 }
             }
-            val picked = remaining.removeAt(bestIdx)
-            result.add(picked)
+
+            val picked = remaining.removeAt(bestIndex)
+            result += picked
             window.addLast(picked)
             if (window.size > windowK) window.removeFirst()
         }
