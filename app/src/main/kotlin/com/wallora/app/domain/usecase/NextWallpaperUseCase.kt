@@ -1,215 +1,551 @@
-package com.wallora.app.domain.usecase
+package com.wallora.app.data.repository
 
-import android.app.WallpaperManager
-import android.content.Context
-import android.util.Log
-import com.wallora.app.data.repository.SettingsRepository
-import com.wallora.app.data.repository.WallpaperRepository
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
+import com.wallora.app.BuildConfig
 import com.wallora.app.di.ApplicationScope
-import com.wallora.app.domain.WallpaperSource
 import com.wallora.app.domain.model.Category
+import com.wallora.app.domain.model.EditParams
 import com.wallora.app.domain.model.SourceId
-import com.wallora.app.domain.model.Wallpaper
-import com.wallora.app.domain.rotation.PickResult
-import com.wallora.app.domain.rotation.RotationEngine
-import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/** Outcome returned to the caller (WorkManager, AlarmReceiver, engine). */
-sealed class NextWallpaperResult {
-    data class Applied(val wallpaper: Wallpaper) : NextWallpaperResult()
-    data object NoPlaylist : NextWallpaperResult()
-    data class Failure(val message: String) : NextWallpaperResult()
-}
-
 /**
- * Picks the next wallpaper from the playlist and applies it.
- *
- * Playlist sources:
- * - `"FAVORITES"`: all saved favorites.
- * - `"CATEGORIES"` (default): reads enabled sources + selected categories from
- *   [SettingsRepository] and fetches a page of wallpapers from [WallpaperRepository].
- *
- * No-repeat: uses [RotationEngine] with recent history from Room. If all candidates
- * have been recently applied, the engine resets the window and picks from the full list.
- *
- * Pre-fetch: when [prefetchNext] is true and the device is on Wi-Fi, the *following*
- * wallpaper's full-res image is kicked off in the background as a fire-and-forget
- * download so the next rotation apply is near-instant. Implemented as a best-effort
- * warm-up via OkHttp (no on-device caching beyond the OS HTTP cache).
+ * Persists all user settings via DataStore (Preferences).
+ * All writes are suspend functions; all reads are [Flow]s for reactive UI.
  */
 @Singleton
-class NextWallpaperUseCase @Inject constructor(
-    @ApplicationContext private val context: Context,
-    private val repository: WallpaperRepository,
-    private val settingsRepository: SettingsRepository,
-    private val applyWallpaperUseCase: ApplyWallpaperUseCase,
-    private val sources: Set<@JvmSuppressWildcards WallpaperSource>,
-    private val okHttpClient: OkHttpClient,
+class SettingsRepository @Inject constructor(
+    private val dataStore: DataStore<Preferences>,
     @ApplicationScope private val appScope: CoroutineScope,
 ) {
-    companion object {
-        private const val TAG = "NextWallpaper"
-        private const val MAX_NO_REPEAT_WINDOW = 30
-    }
 
-    /**
-     * In-memory candidate cache. Avoids re-hitting the source APIs on every rotation
-     * trigger. Populated on first call and refreshed in the background after each apply.
-     */
-    @Volatile private var candidateCache: List<Wallpaper> = emptyList()
+    // ── Schema migration ──────────────────────────────────────────────────────
+    // Version 1: auto-enable sources added in v1.4 (OPENVERSE, NASA, FLICKR, WIKIMEDIA)
+    //            that upgrading users never explicitly disabled (they didn't exist before).
+    private val sourcesSchemaVersionKey = intPreferencesKey("sources_schema_version")
+    private val SOURCES_SCHEMA_CURRENT = 1
 
-    suspend operator fun invoke(
-        target: WallpaperTarget = WallpaperTarget.BOTH,
-    ): NextWallpaperResult = withContext(Dispatchers.IO) {
-        val playlistMode = settingsRepository.rotationPlaylist.first()
-
-        // Fast path: if a wallpaper was pre-fetched and cached to disk, apply it instantly.
-        // This makes gesture-triggered changes feel immediate even after a process restart.
-        val prefetched = settingsRepository.prefetchedWallpaperUrls.first()
-        if (prefetched != null) {
-            Log.d(TAG, "Using pre-fetched wallpaper: ${prefetched.first}")
-            settingsRepository.clearPrefetchedWallpaperUrls()
-            // Reconstruct a minimal Wallpaper so we can record history + kick prefetch
-            val quickWallpaper = Wallpaper(
-                id = "prefetch",
-                sourceId = SourceId.WALLHAVEN,
-                thumbUrl = prefetched.second,
-                fullUrl = prefetched.first,
-                width = 0, height = 0,
-                author = "", authorUrl = "", sourcePageUrl = "",
-                colorHint = null, category = null, tags = emptyList(),
-            )
-            settingsRepository.setCurrentWallpaperUrls(prefetched.first, prefetched.second)
-            if (!isLiveWallpaperActive()) {
-                applyWallpaperUseCase(quickWallpaper, target)
-            } else {
-                repository.addToHistory(quickWallpaper)
-            }
-            scheduleBackgroundPrefetch(playlistMode, quickWallpaper)
-            return@withContext NextWallpaperResult.Applied(quickWallpaper)
-        }
-
-        // Normal path: pick from candidate cache or API
-        val candidates = candidateCache.ifEmpty {
-            getCandidates(playlistMode).also { candidateCache = it }
-        }
-        if (candidates.isEmpty()) {
-            Log.w(TAG, "No candidates for playlist=$playlistMode")
-            return@withContext NextWallpaperResult.NoPlaylist
-        }
-
-        val recentHistory = repository.getRecentHistoryKeys(MAX_NO_REPEAT_WINDOW)
-        val window = RotationEngine.noRepeatWindow(candidates.size, MAX_NO_REPEAT_WINDOW)
-        val recentKeys = recentHistory.take(window).toSet()
-
-        val pickResult = RotationEngine.pickNext(candidates, recentKeys)
-        val wallpaper = when (pickResult) {
-            is PickResult.Empty -> return@withContext NextWallpaperResult.NoPlaylist
-            is PickResult.Found -> {
-                if (pickResult.wasExhausted) Log.d(TAG, "No-repeat window exhausted, resetting")
-                pickResult.wallpaper
-            }
-        }
-
-        Log.d(TAG, "Rotating to: ${wallpaper.globalKey}")
-        settingsRepository.setCurrentWallpaperUrls(wallpaper.fullUrl, wallpaper.thumbUrl)
-
-        if (isLiveWallpaperActive() && target != WallpaperTarget.LOCK) {
-            repository.addToHistory(wallpaper)
-            if (target == WallpaperTarget.BOTH) {
-                applyWallpaperUseCase(wallpaper, WallpaperTarget.LOCK)
-            }
-            scheduleBackgroundPrefetch(playlistMode, wallpaper)
-            return@withContext NextWallpaperResult.Applied(wallpaper)
-        }
-
-        val applyResult = applyWallpaperUseCase(wallpaper, target)
-        return@withContext when (applyResult) {
-            is ApplyResult.Success -> {
-                scheduleBackgroundPrefetch(playlistMode, wallpaper)
-                NextWallpaperResult.Applied(wallpaper)
-            }
-            is ApplyResult.Failure -> NextWallpaperResult.Failure(applyResult.message)
-        }
-    }
-
-    /**
-     * Fire-and-forget: refresh the candidate list and warm the OkHttp disk cache for
-     * the wallpaper that is most likely to be picked on the next rotation trigger.
-     * Runs on [appScope] so it survives the caller finishing.
-     */
-    private fun scheduleBackgroundPrefetch(playlistMode: String, justApplied: Wallpaper) {
-        appScope.launch(Dispatchers.IO) {
-            try {
-                val fresh = getCandidates(playlistMode)
-                if (fresh.isNotEmpty()) candidateCache = fresh
-
-                val updatedHistory = repository.getRecentHistoryKeys(MAX_NO_REPEAT_WINDOW)
-                val window = RotationEngine.noRepeatWindow(fresh.size, MAX_NO_REPEAT_WINDOW)
-                val nextPick = RotationEngine.pickNext(fresh, updatedHistory.take(window).toSet())
-                if (nextPick is PickResult.Found) {
-                    val next = nextPick.wallpaper
-                    Log.d(TAG, "Prefetching: ${next.fullUrl}")
-                    okHttpClient.newCall(Request.Builder().url(next.fullUrl).build()).execute().close()
-                    // Persist the pre-fetched URL so the next invocation can apply it instantly
-                    // (survives process restart — the image is already in OkHttp disk cache)
-                    settingsRepository.setPrefetchedWallpaperUrls(next.fullUrl, next.thumbUrl)
+    init {
+        appScope.launch {
+            dataStore.edit { prefs ->
+                if ((prefs[sourcesSchemaVersionKey] ?: 0) < SOURCES_SCHEMA_CURRENT) {
+                    val current = prefs[stringSetPreferencesKey("enabled_sources")]?.toMutableSet()
+                    if (current != null) {
+                        current.addAll(listOf("OPENVERSE", "NASA", "FLICKR", "WIKIMEDIA"))
+                        prefs[stringSetPreferencesKey("enabled_sources")] = current
+                    }
+                    prefs[sourcesSchemaVersionKey] = SOURCES_SCHEMA_CURRENT
                 }
-            } catch (e: Exception) {
-                Log.d(TAG, "Background prefetch skipped: ${e.message}")
             }
         }
     }
 
-    /**
-     * Returns true when Wallora's own live wallpaper service is the currently active wallpaper.
-     * This is the real source of truth — no flag lifecycle to maintain. When true, the rotation
-     * writes the new URL to DataStore and lets the live engine pick it up; it does NOT call
-     * WallpaperManager.setBitmap(FLAG_SYSTEM), which would deactivate the live wallpaper.
-     */
-    private fun isLiveWallpaperActive(): Boolean = try {
-        WallpaperManager.getInstance(context).wallpaperInfo?.packageName == context.packageName
-    } catch (_: Exception) {
-        false
+    // ── Source toggles ──────────────────────────────────────────────────────
+    private val enabledSourcesKey = stringSetPreferencesKey("enabled_sources")
+
+    val enabledSources: Flow<Set<SourceId>> = dataStore.data.map { prefs ->
+        val raw = prefs[enabledSourcesKey] ?: defaultEnabledSourceNames()
+        raw.mapNotNull { runCatching { SourceId.valueOf(it) }.getOrNull() }.toSet()
     }
 
-    private suspend fun getCandidates(playlistMode: String): List<Wallpaper> =
-        when (playlistMode) {
-            "FAVORITES" -> repository.getFavoritesSnapshot()
-            else -> getCategoryBrowseCandidates()
+    suspend fun setSourceEnabled(source: SourceId, enabled: Boolean) {
+        dataStore.edit { prefs ->
+            val current = prefs[enabledSourcesKey]?.toMutableSet()
+                ?: defaultEnabledSourceNames().toMutableSet()
+            if (enabled) current.add(source.name) else current.remove(source.name)
+            prefs[enabledSourcesKey] = current
         }
+    }
+
+    // ── Category defaults ───────────────────────────────────────────────────��
+    private val selectedCategoriesKey = stringSetPreferencesKey("selected_categories")
+
+    val selectedCategories: Flow<Set<Category>> = dataStore.data.map { prefs ->
+        // null = all categories
+        prefs[selectedCategoriesKey]
+            ?.mapNotNull { runCatching { Category.valueOf(it) }.getOrNull() }
+            ?.toSet()
+            ?: DEFAULT_CATEGORIES  // fresh install: start with curated defaults
+    }
+
+    suspend fun setSelectedCategories(categories: Set<Category>) {
+        dataStore.edit { prefs ->
+            prefs[selectedCategoriesKey] = categories.map { it.name }.toSet()
+        }
+    }
+
+    // ── Rotation settings ────────────────────────────────────────────────────
+    private val rotationEnabledKey = booleanPreferencesKey("rotation_enabled")
+    private val rotationIntervalMsKey = longPreferencesKey("rotation_interval_ms")
+    private val rotationTimesKey = stringSetPreferencesKey("rotation_times")       // "HH:mm" strings
+    private val rotationOnUnlockKey = booleanPreferencesKey("rotation_on_unlock")
+    private val rotationWifiOnlyKey = booleanPreferencesKey("rotation_wifi_only")
+    private val rotationChargingOnlyKey = booleanPreferencesKey("rotation_charging_only")
+    private val rotationPlaylistKey = stringPreferencesKey("rotation_playlist")    // "FAVORITES" | "CATEGORIES" | "COLLECTION"
+    private val activeCollectionIdKey = longPreferencesKey("active_collection_id")
+    private val activePlaylistIdKey = longPreferencesKey("active_playlist_id")
+
+    val rotationEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[rotationEnabledKey] ?: false
+    }
+    val rotationIntervalMs: Flow<Long> = dataStore.data.map { prefs ->
+        prefs[rotationIntervalMsKey] ?: 3_600_000L // 1 hour default
+    }
+    val rotationTimes: Flow<Set<String>> = dataStore.data.map { prefs ->
+        prefs[rotationTimesKey] ?: emptySet()
+    }
+    val rotationOnUnlock: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[rotationOnUnlockKey] ?: false
+    }
+    val rotationWifiOnly: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[rotationWifiOnlyKey] ?: false
+    }
+    val rotationChargingOnly: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[rotationChargingOnlyKey] ?: false
+    }
+    val rotationPlaylist: Flow<String> = dataStore.data.map { prefs ->
+        prefs[rotationPlaylistKey] ?: "CATEGORIES"
+    }
+    val activeCollectionId: Flow<Long?> = dataStore.data.map { prefs ->
+        prefs[activeCollectionIdKey]
+    }
+    val activePlaylistId: Flow<Long?> = dataStore.data.map { prefs ->
+        prefs[activePlaylistIdKey]
+    }
+
+    suspend fun setRotationEnabled(enabled: Boolean) =
+        dataStore.edit { it[rotationEnabledKey] = enabled }
+
+    suspend fun setRotationIntervalMs(ms: Long) =
+        dataStore.edit { it[rotationIntervalMsKey] = ms }
+
+    suspend fun setRotationTimes(times: Set<String>) =
+        dataStore.edit { it[rotationTimesKey] = times }
+
+    suspend fun setRotationOnUnlock(enabled: Boolean) =
+        dataStore.edit { it[rotationOnUnlockKey] = enabled }
+
+    suspend fun setRotationWifiOnly(enabled: Boolean) =
+        dataStore.edit { it[rotationWifiOnlyKey] = enabled }
+
+    suspend fun setRotationChargingOnly(enabled: Boolean) =
+        dataStore.edit { it[rotationChargingOnlyKey] = enabled }
+
+    suspend fun setRotationPlaylist(playlist: String) =
+        dataStore.edit { it[rotationPlaylistKey] = playlist }
+
+    suspend fun setActiveCollectionId(collectionId: Long?) =
+        dataStore.edit { prefs ->
+            if (collectionId == null) prefs.remove(activeCollectionIdKey)
+            else prefs[activeCollectionIdKey] = collectionId
+        }
+
+    suspend fun setActivePlaylistId(playlistId: Long?) =
+        dataStore.edit { prefs ->
+            if (playlistId == null) prefs.remove(activePlaylistIdKey)
+            else prefs[activePlaylistIdKey] = playlistId
+        }
+
+    // ── Current wallpaper (for live engine observability) ────────────────────
+    private val currentWallpaperFullUrlKey = stringPreferencesKey("current_wallpaper_full_url")
+    private val currentWallpaperThumbUrlKey = stringPreferencesKey("current_wallpaper_thumb_url")
 
     /**
-     * Fetches one page of wallpapers per configured + enabled source for the currently
-     * selected categories. Calls [WallpaperSource.browse] with page "1" directly to avoid
-     * Paging 3 infrastructure overhead in a background context.
+     * The full-res and thumb URL of the most recently applied wallpaper.
+     * The live wallpaper engine observes this to reload its bitmap on rotation.
+     * Null when no wallpaper has been persisted yet (fresh install).
      */
-    private suspend fun getCategoryBrowseCandidates(): List<Wallpaper> {
-        val enabledSources = settingsRepository.enabledSources.first()
-        val categories = settingsRepository.selectedCategories.first()
-            .toList()
-            .ifEmpty { Category.entries.toList() }
+    val currentWallpaperUrls: Flow<Pair<String, String>?> = dataStore.data.map { prefs ->
+        val full = prefs[currentWallpaperFullUrlKey] ?: return@map null
+        full to (prefs[currentWallpaperThumbUrlKey] ?: "")
+    }
 
-        // Collect one page per configured + enabled source
-        val results = mutableListOf<Wallpaper>()
-        for (source in sources) {
-            if (!source.isConfigured || source.id !in enabledSources) continue
-            try {
-                val page = source.browse(categories = categories, page = "1")
-                results += page.items
-            } catch (e: Exception) {
-                Log.w(TAG, "Source ${source.id} failed during rotation fetch: ${e.message}")
-            }
+    suspend fun setCurrentWallpaperUrls(fullUrl: String, thumbUrl: String) {
+        dataStore.edit { prefs ->
+            prefs[currentWallpaperFullUrlKey] = fullUrl
+            prefs[currentWallpaperThumbUrlKey] = thumbUrl
         }
-        return results
+    }
+
+    // ── Gesture & parallax ───────────────────────────────────────────────────
+    // Note: "is live wallpaper active" is no longer stored in DataStore — the real source of
+    // truth is WallpaperManager.wallpaperInfo.packageName == context.packageName (checked at
+    // runtime in NextWallpaperUseCase so rotation never deactivates the live wallpaper).
+    private val doubleTapGestureKey = booleanPreferencesKey("double_tap_gesture")
+    private val parallaxEnabledKey = booleanPreferencesKey("parallax_enabled")
+
+    val doubleTapGestureEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[doubleTapGestureKey] ?: false  // DEFAULT OFF: most launchers consume the gesture
+    }
+    val parallaxEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[parallaxEnabledKey] ?: true  // DEFAULT ON per spec
+    }
+
+    suspend fun setDoubleTapGesture(enabled: Boolean) =
+        dataStore.edit { it[doubleTapGestureKey] = enabled }
+
+    suspend fun setParallaxEnabled(enabled: Boolean) =
+        dataStore.edit { it[parallaxEnabledKey] = enabled }
+
+    // ── EditParams (default look for live mode) ───────────────────────────────
+    private val editBlurKey = floatPreferencesKey("edit_blur")
+    private val editBrightnessKey = floatPreferencesKey("edit_brightness")
+    private val editContrastKey = floatPreferencesKey("edit_contrast")
+    private val editSaturationKey = floatPreferencesKey("edit_saturation")
+    private val editPanXKey = floatPreferencesKey("edit_pan_x")
+    private val editPanYKey = floatPreferencesKey("edit_pan_y")
+
+    val defaultEditParams: Flow<EditParams> = dataStore.data.map { prefs ->
+        EditParams(
+            blur = prefs[editBlurKey] ?: 0f,
+            brightness = prefs[editBrightnessKey] ?: 0f,
+            contrast = prefs[editContrastKey] ?: 1f,
+            saturation = prefs[editSaturationKey] ?: 1f,
+            panX = prefs[editPanXKey] ?: 0f,
+            panY = prefs[editPanYKey] ?: 0f,
+        )
+    }
+
+    suspend fun setDefaultEditParams(params: EditParams) = dataStore.edit { prefs ->
+        prefs[editBlurKey] = params.blur
+        prefs[editBrightnessKey] = params.brightness
+        prefs[editContrastKey] = params.contrast
+        prefs[editSaturationKey] = params.saturation
+        prefs[editPanXKey] = params.panX
+        prefs[editPanYKey] = params.panY
+    }
+
+    // ── Theme ──────────────────────────────────────────────────────────
+    private val themeKey = stringPreferencesKey("theme")  // "SYSTEM" | "LIGHT" | "DARK"
+
+    val theme: Flow<String> = dataStore.data.map { prefs -> prefs[themeKey] ?: "SYSTEM" }
+
+    suspend fun setTheme(theme: String) = dataStore.edit { it[themeKey] = theme }
+
+    // ── Cache management ─────────────────────────────────────────────────────
+    private val cacheTtlMsKey = longPreferencesKey("cache_ttl_ms")
+
+    val cacheTtlMs: Flow<Long> = dataStore.data.map { prefs ->
+        prefs[cacheTtlMsKey] ?: 3_600_000L
+    }
+
+    suspend fun setCacheTtlMs(ms: Long) = dataStore.edit { it[cacheTtlMsKey] = ms }
+
+    // ── User API keys (override BuildConfig at runtime) ──────────────────────
+    private val userPexelsKeyKey = stringPreferencesKey("user_pexels_key")
+    private val userUnsplashKeyKey = stringPreferencesKey("user_unsplash_key")
+    private val userWallhavenKeyKey = stringPreferencesKey("user_wallhaven_key")
+    private val userPixabayKeyKey = stringPreferencesKey("user_pixabay_key")
+    private val userFlickrKeyKey = stringPreferencesKey("user_flickr_key")
+    private val userRedditClientIdKey = stringPreferencesKey("user_reddit_client_id")
+    private val redditDeviceIdKey = stringPreferencesKey("reddit_device_id")
+
+    val userPexelsKey: Flow<String> = dataStore.data.map { it[userPexelsKeyKey] ?: "" }
+    val userUnsplashKey: Flow<String> = dataStore.data.map { it[userUnsplashKeyKey] ?: "" }
+    val userWallhavenKey: Flow<String> = dataStore.data.map { it[userWallhavenKeyKey] ?: "" }
+    val userPixabayKey: Flow<String> = dataStore.data.map { it[userPixabayKeyKey] ?: "" }
+    val userFlickrKey: Flow<String> = dataStore.data.map { it[userFlickrKeyKey] ?: "" }
+    val userRedditClientId: Flow<String> = dataStore.data.map { it[userRedditClientIdKey] ?: "" }
+
+    suspend fun setUserPexelsKey(key: String) = dataStore.edit { it[userPexelsKeyKey] = key }
+    suspend fun setUserUnsplashKey(key: String) = dataStore.edit { it[userUnsplashKeyKey] = key }
+    suspend fun setUserWallhavenKey(key: String) = dataStore.edit { it[userWallhavenKeyKey] = key }
+    suspend fun setUserPixabayKey(key: String) = dataStore.edit { it[userPixabayKeyKey] = key }
+    suspend fun setUserFlickrKey(key: String) = dataStore.edit { it[userFlickrKeyKey] = key }
+    suspend fun setUserRedditClientId(clientId: String) =
+        dataStore.edit { it[userRedditClientIdKey] = clientId }
+
+    /**
+     * Returns the persisted per-install device ID for Reddit userless OAuth.
+     * Generates and persists a new UUID on first call (atomically via DataStore).
+     */
+    suspend fun getOrCreateRedditDeviceId(): String {
+        val existing = dataStore.data.map { it[redditDeviceIdKey] }.first()
+        if (!existing.isNullOrBlank()) return existing
+        val newId = java.util.UUID.randomUUID().toString()
+        dataStore.edit { it[redditDeviceIdKey] = newId }
+        return newId
+    }
+
+    // ── User Reddit subreddits ───────────────────────────────────────────────
+    private val userSubredditsKey = stringSetPreferencesKey("user_subreddits")
+
+    val userSubreddits: Flow<List<String>> = dataStore.data.map { prefs ->
+        prefs[userSubredditsKey]?.toList()?.sorted() ?: DEFAULT_SUBREDDITS
+    }
+
+    suspend fun setUserSubreddits(subs: Set<String>) =
+        dataStore.edit { it[userSubredditsKey] = subs }
+
+    // ── Custom category keywords ─────────────────────────────────────────────
+    private val customKeywordsKey = stringSetPreferencesKey("custom_keywords")
+
+    val customKeywords: Flow<Set<String>> = dataStore.data.map { prefs ->
+        prefs[customKeywordsKey] ?: emptySet()
+    }
+
+    suspend fun setCustomKeywords(keywords: Set<String>) =
+        dataStore.edit { it[customKeywordsKey] = keywords }
+
+    // ── Prefetched next wallpaper (for instant gesture apply) ────────────────
+    private val prefetchedFullUrlKey = stringPreferencesKey("prefetched_full_url")
+    private val prefetchedThumbUrlKey = stringPreferencesKey("prefetched_thumb_url")
+
+    val prefetchedWallpaperUrls: Flow<Pair<String, String>?> = dataStore.data.map { prefs ->
+        val full = prefs[prefetchedFullUrlKey] ?: return@map null
+        full to (prefs[prefetchedThumbUrlKey] ?: "")
+    }
+
+    suspend fun setPrefetchedWallpaperUrls(fullUrl: String, thumbUrl: String) {
+        dataStore.edit { prefs ->
+            prefs[prefetchedFullUrlKey] = fullUrl
+            prefs[prefetchedThumbUrlKey] = thumbUrl
+        }
+    }
+
+    suspend fun clearPrefetchedWallpaperUrls() {
+        dataStore.edit { prefs ->
+            prefs.remove(prefetchedFullUrlKey)
+            prefs.remove(prefetchedThumbUrlKey)
+        }
+    }
+
+    /**
+     * Sources enabled on a fresh install: the keyless four (work with no key) plus any key-based
+     * source whose key is already baked into the build (the CI release ships all keys). This makes
+     * the app "keyless-first" — a great grid with zero setup — while a full release still lights up
+     * everything, and user-added keys auto-enable their source (see SettingsViewModel).
+     */
+    private fun defaultEnabledSourceNames(): Set<String> {
+        val keyless = setOf("WALLHAVEN", "OPENVERSE", "NASA", "WIKIMEDIA")
+        val keyed = buildSet {
+            if (BuildConfig.PEXELS_API_KEY.isNotBlank()) add("PEXELS")
+            if (BuildConfig.UNSPLASH_ACCESS_KEY.isNotBlank()) add("UNSPLASH")
+            if (BuildConfig.PIXABAY_API_KEY.isNotBlank()) add("PIXABAY")
+            if (BuildConfig.FLICKR_API_KEY.isNotBlank()) add("FLICKR")
+            if (BuildConfig.REDDIT_CLIENT_ID.isNotBlank()) add("REDDIT")
+        }
+        return keyless + keyed
+    }
+
+    companion object {
+        val DEFAULT_SUBREDDITS = listOf("iWallpaper")
+
+        /**
+         * Default categories — a spread of distinct subjects and colours (green/blue nature, colourful
+         * space, varied cityscapes, saturated vibrant, varied animals, colourful abstract) so the very
+         * first grid looks rich and varied. The feed engine rotates and colour-diversifies from here.
+         */
+        val DEFAULT_CATEGORIES = setOf(
+            Category.NATURE,
+            Category.SPACE,
+            Category.CITY,
+            Category.VIBRANT,
+            Category.ANIMALS,
+            Category.ABSTRACT,
+        )
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
